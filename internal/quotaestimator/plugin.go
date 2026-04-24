@@ -17,5 +17,5 @@ func (usagePlugin) HandleUsage(ctx context.Context, record coreusage.Record) {
 	if estimator == nil {
 		return
 	}
-	estimator.RecordUsage(record, SelectedAuthFromContext(ctx))
+	estimator.RecordUsageWithContext(ctx, record, SelectedAuthFromContext(ctx))
 }

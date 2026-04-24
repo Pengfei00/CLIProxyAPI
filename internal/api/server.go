@@ -271,6 +271,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	s.mgmt.SetQuotaEstimator(quotaEstimator)
+	quotaEstimator.SetUsageFetcher(s.fetchQuotaEstimatorUsage)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}

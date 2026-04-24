@@ -1,6 +1,7 @@
 package quotaestimator
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -76,6 +77,43 @@ func TestRecordUsageAggregatesPerModel(t *testing.T) {
 	}
 	if got := current.PerModel["gpt-5.4-mini"].TotalTokens; got != 68 {
 		t.Fatalf("gpt-5.4-mini total_tokens = %d, want 68", got)
+	}
+}
+
+func TestFirstObservationSetsLastRefreshTime(t *testing.T) {
+	t.Parallel()
+
+	estimator := New("")
+	auth := testCodexOAuthAuth()
+	authIndex := auth.EnsureIndex()
+	start := time.Date(2026, 4, 24, 0, 0, 0, 0, time.UTC)
+
+	estimator.RecordObservation(QuotaObservation{
+		ObservedAt: start,
+		AuthID:     auth.ID,
+		AuthIndex:  authIndex,
+		PlanType:   "pro",
+		Windows: []QuotaWindowObservation{{
+			WindowType:  "5h",
+			UsedPercent: 30,
+			Available:   true,
+			ResetAt:     start.Add(5 * time.Hour),
+		}},
+	})
+
+	detail := estimator.Detail(authIndex, auth)
+	if detail.CodexAccountSummary.LastQuotaRefreshAt.IsZero() {
+		t.Fatal("expected last_quota_refresh_at to be recorded on first observation")
+	}
+	if !detail.CodexAccountSummary.LastQuotaRefreshAt.Equal(start) {
+		t.Fatalf("last_quota_refresh_at = %v, want %v", detail.CodexAccountSummary.LastQuotaRefreshAt, start)
+	}
+	if detail.CodexAccountSummary.LastObservationAt.IsZero() {
+		t.Fatal("expected last_observation_at to be recorded on first observation")
+	}
+	current := detail.CurrentEstimates["5h"]
+	if current.LastRefreshAt.IsZero() {
+		t.Fatal("expected current estimate last_refresh_at to be populated")
 	}
 }
 
@@ -163,6 +201,72 @@ func TestRecordObservationDetectsRefreshAndClosesSample(t *testing.T) {
 	}
 }
 
+func TestRecordUsageWithContextAutoRefreshKeepsCurrentCycle(t *testing.T) {
+	t.Parallel()
+
+	estimator := New("")
+	auth := testCodexOAuthAuth()
+	authIndex := auth.EnsureIndex()
+	start := time.Date(2026, 4, 24, 0, 0, 0, 0, time.UTC)
+	refreshObservedAt := start.Add(5 * time.Hour)
+	refreshCalls := 0
+
+	estimator.now = func() time.Time {
+		return refreshObservedAt
+	}
+	estimator.SetUsageFetcher(func(ctx context.Context, gotAuth *coreauth.Auth) ([]byte, error) {
+		refreshCalls++
+		if gotAuth == nil || gotAuth.EnsureIndex() != authIndex {
+			t.Fatalf("unexpected auth passed to usage fetcher: %#v", gotAuth)
+		}
+		return []byte(`{"plan_type":"pro","windows":[{"window_type":"5h","used_percent":80,"available":true,"reset_at":"2026-04-24T10:00:00Z"}]}`), nil
+	})
+
+	estimator.RecordObservation(QuotaObservation{
+		ObservedAt: start,
+		AuthID:     auth.ID,
+		AuthIndex:  authIndex,
+		PlanType:   "pro",
+		Windows: []QuotaWindowObservation{{
+			WindowType:  "5h",
+			UsedPercent: 60,
+			Available:   true,
+			ResetAt:     refreshObservedAt,
+		}},
+	})
+
+	estimator.RecordUsageWithContext(context.Background(), coreusage.Record{
+		AuthID:      auth.ID,
+		AuthIndex:   authIndex,
+		Model:       "gpt-5.4",
+		RequestedAt: refreshObservedAt.Add(2 * time.Minute),
+		Detail: coreusage.Detail{
+			InputTokens:  60,
+			OutputTokens: 20,
+			TotalTokens:  80,
+		},
+	}, auth)
+
+	if refreshCalls != 1 {
+		t.Fatalf("usage fetch calls = %d, want 1", refreshCalls)
+	}
+
+	detail := estimator.Detail(authIndex, auth)
+	if len(detail.ClosedSamples["5h"]) != 0 {
+		t.Fatalf("closed samples len = %d, want 0", len(detail.ClosedSamples["5h"]))
+	}
+	current := detail.CurrentEstimates["5h"]
+	if !current.CurrentCycleStartedAt.Equal(start) {
+		t.Fatalf("current_cycle_started_at = %v, want %v", current.CurrentCycleStartedAt, start)
+	}
+	if current.CurrentUsedPercent != 80 {
+		t.Fatalf("current_used_percent = %v, want 80", current.CurrentUsedPercent)
+	}
+	if !current.LastRefreshAt.Equal(refreshObservedAt) {
+		t.Fatalf("last_refresh_at = %v, want %v", current.LastRefreshAt, refreshObservedAt)
+	}
+}
+
 func TestRecordExhaustionThenRefresh(t *testing.T) {
 	t.Parallel()
 
@@ -245,6 +349,79 @@ func TestRecordExhaustionThenRefresh(t *testing.T) {
 	}
 	if len(detail.Exhaustions) != 1 {
 		t.Fatalf("exhaustion events len = %d, want 1", len(detail.Exhaustions))
+	}
+}
+
+func TestRecordUsageWithContextAutoRefreshStartsNewCycleAfterReset(t *testing.T) {
+	t.Parallel()
+
+	estimator := New("")
+	auth := testCodexOAuthAuth()
+	authIndex := auth.EnsureIndex()
+	start := time.Date(2026, 4, 24, 0, 0, 0, 0, time.UTC)
+	refreshBoundary := start.Add(5 * time.Hour)
+	refreshObservedAt := refreshBoundary.Add(2 * time.Minute)
+
+	estimator.now = func() time.Time {
+		return refreshObservedAt
+	}
+	estimator.SetUsageFetcher(func(ctx context.Context, gotAuth *coreauth.Auth) ([]byte, error) {
+		return []byte(`{"plan_type":"pro","windows":[{"window_type":"5h","used_percent":10,"available":true,"reset_at":"2026-04-24T11:00:00Z"}]}`), nil
+	})
+
+	estimator.RecordObservation(QuotaObservation{
+		ObservedAt: start,
+		AuthID:     auth.ID,
+		AuthIndex:  authIndex,
+		PlanType:   "pro",
+		Windows: []QuotaWindowObservation{{
+			WindowType:  "5h",
+			UsedPercent: 70,
+			Available:   true,
+			ResetAt:     refreshBoundary,
+		}},
+	})
+	estimator.RecordUsage(coreusage.Record{
+		AuthID:      auth.ID,
+		AuthIndex:   authIndex,
+		Model:       "gpt-5.4",
+		RequestedAt: start.Add(30 * time.Minute),
+		Detail: coreusage.Detail{
+			InputTokens:  40,
+			OutputTokens: 10,
+			TotalTokens:  50,
+		},
+	}, auth)
+
+	estimator.RecordUsageWithContext(context.Background(), coreusage.Record{
+		AuthID:      auth.ID,
+		AuthIndex:   authIndex,
+		Model:       "gpt-5.4",
+		RequestedAt: refreshObservedAt.Add(1 * time.Minute),
+		Detail: coreusage.Detail{
+			InputTokens:  20,
+			OutputTokens: 10,
+			TotalTokens:  30,
+		},
+	}, auth)
+
+	detail := estimator.Detail(authIndex, auth)
+	samples := detail.ClosedSamples["5h"]
+	if len(samples) != 1 {
+		t.Fatalf("closed samples len = %d, want 1", len(samples))
+	}
+	if samples[0].CloseReason != closeReasonRefreshedBeforeFull {
+		t.Fatalf("close_reason = %q, want %q", samples[0].CloseReason, closeReasonRefreshedBeforeFull)
+	}
+	current := detail.CurrentEstimates["5h"]
+	if !current.CurrentCycleStartedAt.Equal(refreshObservedAt) {
+		t.Fatalf("current_cycle_started_at = %v, want %v", current.CurrentCycleStartedAt, refreshObservedAt)
+	}
+	if current.CurrentUsedPercent != 10 {
+		t.Fatalf("current_used_percent = %v, want 10", current.CurrentUsedPercent)
+	}
+	if current.CurrentTokens.TotalTokens != 30 {
+		t.Fatalf("current total_tokens = %d, want 30", current.CurrentTokens.TotalTokens)
 	}
 }
 

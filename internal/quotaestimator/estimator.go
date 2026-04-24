@@ -2,6 +2,7 @@ package quotaestimator
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -29,6 +31,7 @@ const (
 	observationNoisePercent        = 0.5
 	exhaustedThresholdPercent      = 99.0
 	defaultPersistDebounce         = 750 * time.Millisecond
+	autoRefreshMinInterval         = 30 * time.Second
 	closeReasonQuotaRefreshed      = "quota_refreshed"
 	closeReasonRefreshedBeforeFull = "refreshed_before_exhausted"
 	closeReasonExhaustedRefreshed  = "exhausted_then_refreshed"
@@ -71,6 +74,7 @@ type OpenQuotaCycle struct {
 	StartedAt          time.Time               `json:"started_at"`
 	StartSource        string                  `json:"start_source"`
 	LastRefreshAt      time.Time               `json:"last_refresh_at,omitempty"`
+	NextRefreshAt      time.Time               `json:"next_refresh_at,omitempty"`
 	StartUsedPercent   float64                 `json:"start_used_percent"`
 	CurrentUsedPercent float64                 `json:"current_used_percent"`
 	LastObservedAt     time.Time               `json:"last_observed_at,omitempty"`
@@ -171,30 +175,49 @@ type persistedState struct {
 	estimatorState
 }
 
+// UsageFetcher fetches the latest wham/usage snapshot for one Codex auth.
+type UsageFetcher func(ctx context.Context, auth *coreauth.Auth) ([]byte, error)
+
 // Estimator tracks Codex quota-cycle observations, open windows, and historical samples.
 type Estimator struct {
-	mu              sync.RWMutex
-	path            string
-	now             func() time.Time
-	persistDebounce time.Duration
-	persistTimer    *time.Timer
-	persistDirty    bool
-	closed          bool
-	state           estimatorState
+	mu                     sync.RWMutex
+	path                   string
+	now                    func() time.Time
+	persistDebounce        time.Duration
+	persistTimer           *time.Timer
+	persistDirty           bool
+	closed                 bool
+	usageFetcher           UsageFetcher
+	autoRefreshMinInterval time.Duration
+	autoRefreshAttempt     map[string]time.Time
+	autoRefreshGroup       singleflight.Group
+	state                  estimatorState
 }
 
 // New creates a new estimator and loads previously persisted state when available.
 func New(path string) *Estimator {
 	estimator := &Estimator{
-		path:            strings.TrimSpace(path),
-		now:             time.Now,
-		persistDebounce: defaultPersistDebounce,
+		path:                   strings.TrimSpace(path),
+		now:                    time.Now,
+		persistDebounce:        defaultPersistDebounce,
+		autoRefreshMinInterval: autoRefreshMinInterval,
+		autoRefreshAttempt:     make(map[string]time.Time),
 	}
 	estimator.state = newEstimatorState()
 	if err := estimator.load(); err != nil {
 		log.WithError(err).Warn("quota estimator: failed to load state")
 	}
 	return estimator
+}
+
+// SetUsageFetcher configures the synchronous wham/usage fetcher used for auto-refresh checks.
+func (e *Estimator) SetUsageFetcher(fetcher UsageFetcher) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	e.usageFetcher = fetcher
+	e.mu.Unlock()
 }
 
 func newEstimatorState() estimatorState {
@@ -312,14 +335,13 @@ func (e *Estimator) RecordObservation(observation QuotaObservation) {
 				WindowType:         window.WindowType,
 				StartedAt:          observation.ObservedAt,
 				StartSource:        startSource,
+				LastRefreshAt:      observation.ObservedAt,
+				NextRefreshAt:      window.ResetAt,
 				StartUsedPercent:   window.UsedPercent,
 				CurrentUsedPercent: window.UsedPercent,
 				LastObservedAt:     observation.ObservedAt,
 				PerModel:           make(map[string]TokenSummary),
 				ResetIdentifier:    window.ResetIdentifier,
-			}
-			if startSource == startSourceQuotaRefresh {
-				cycle.LastRefreshAt = observation.ObservedAt
 			}
 			if hasPending {
 				applyPendingUsage(&cycle, pending)
@@ -334,8 +356,12 @@ func (e *Estimator) RecordObservation(observation QuotaObservation) {
 
 		cycle.AuthID = firstNonEmpty(cycle.AuthID, observation.AuthID)
 		cycle.PlanType = firstNonEmpty(observation.PlanType, cycle.PlanType)
+		cycle.LastRefreshAt = observation.ObservedAt
 		cycle.CurrentUsedPercent = window.UsedPercent
 		cycle.LastObservedAt = observation.ObservedAt
+		if !window.ResetAt.IsZero() {
+			cycle.NextRefreshAt = window.ResetAt
+		}
 		cycle.ResetIdentifier = firstNonEmpty(window.ResetIdentifier, cycle.ResetIdentifier)
 		if cycle.ExhaustedPending && (window.UsedPercent >= exhaustedThresholdPercent || !window.Available) {
 			cycle.ExhaustedConfirmed = true
@@ -351,6 +377,9 @@ func (e *Estimator) RecordObservation(observation QuotaObservation) {
 	history = keepTail(history, maxObservationHistoryPerAuth)
 	e.state.Observations[observation.AuthIndex] = history
 	e.recomputeCurrentEstimatesLocked(observation.AuthIndex)
+	if !e.hasDueRefreshLocked(observation.AuthIndex, observation.ObservedAt) {
+		delete(e.autoRefreshAttempt, observation.AuthIndex)
+	}
 	e.schedulePersistLocked()
 }
 
@@ -366,6 +395,11 @@ func (e *Estimator) RecordObservationFromBody(auth *coreauth.Auth, raw []byte, o
 
 // RecordUsage adds request tokens into the currently open cycle for the selected Codex auth.
 func (e *Estimator) RecordUsage(record coreusage.Record, auth *coreauth.Auth) {
+	e.RecordUsageWithContext(context.Background(), record, auth)
+}
+
+// RecordUsageWithContext adds request tokens and performs auto-refresh checks using the request context.
+func (e *Estimator) RecordUsageWithContext(ctx context.Context, record coreusage.Record, auth *coreauth.Auth) {
 	if e == nil || !IsCodexOAuthAuth(auth) {
 		return
 	}
@@ -392,6 +426,12 @@ func (e *Estimator) RecordUsage(record coreusage.Record, auth *coreauth.Auth) {
 	recordedAt := normalizeTime(record.RequestedAt)
 	if recordedAt.IsZero() {
 		recordedAt = normalizeTime(e.now())
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if e.shouldAutoRefreshUsage(authIndex, recordedAt) {
+		e.refreshObservationForUsage(ctx, auth.Clone(), authIndex, recordedAt)
 	}
 
 	e.mu.Lock()
@@ -436,6 +476,88 @@ func (e *Estimator) RecordUsage(record coreusage.Record, auth *coreauth.Auth) {
 	}
 	e.recomputeCurrentEstimatesLocked(authIndex)
 	e.schedulePersistLocked()
+}
+
+func (e *Estimator) shouldAutoRefreshUsage(authIndex string, recordedAt time.Time) bool {
+	if e == nil || authIndex == "" || recordedAt.IsZero() {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.usageFetcher == nil {
+		return false
+	}
+	e.ensureStateLocked()
+	if !e.hasDueRefreshLocked(authIndex, recordedAt) {
+		return false
+	}
+	if lastAttempt := e.autoRefreshAttempt[authIndex]; !lastAttempt.IsZero() &&
+		recordedAt.Before(lastAttempt.Add(e.autoRefreshMinInterval)) {
+		return false
+	}
+	e.autoRefreshAttempt[authIndex] = recordedAt
+	return true
+}
+
+func (e *Estimator) refreshObservationForUsage(ctx context.Context, auth *coreauth.Auth, authIndex string, recordedAt time.Time) {
+	if e == nil || auth == nil || authIndex == "" {
+		return
+	}
+	_, err, _ := e.autoRefreshGroup.Do(authIndex, func() (any, error) {
+		if !e.hasDueRefresh(authIndex, recordedAt) {
+			return nil, nil
+		}
+		body, errFetch := e.fetchUsageSnapshot(ctx, auth)
+		if errFetch != nil {
+			return nil, errFetch
+		}
+		observedAt := normalizeTime(e.now())
+		if observedAt.IsZero() {
+			observedAt = recordedAt
+		}
+		if observedAt.IsZero() {
+			observedAt = normalizeTime(time.Now())
+		}
+		if errRecord := e.RecordObservationFromBody(auth, body, observedAt); errRecord != nil {
+			return nil, errRecord
+		}
+		return nil, nil
+	})
+	if err != nil {
+		log.WithError(err).Debug("quota estimator: failed to auto-refresh wham/usage observation")
+	}
+}
+
+func (e *Estimator) fetchUsageSnapshot(ctx context.Context, auth *coreauth.Auth) ([]byte, error) {
+	e.mu.RLock()
+	fetcher := e.usageFetcher
+	e.mu.RUnlock()
+	if fetcher == nil {
+		return nil, errors.New("quota estimator: usage fetcher not configured")
+	}
+	return fetcher(ctx, auth)
+}
+
+func (e *Estimator) hasDueRefresh(authIndex string, recordedAt time.Time) bool {
+	if e == nil || authIndex == "" || recordedAt.IsZero() {
+		return false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.hasDueRefreshLocked(authIndex, recordedAt)
+}
+
+func (e *Estimator) hasDueRefreshLocked(authIndex string, recordedAt time.Time) bool {
+	if recordedAt.IsZero() {
+		return false
+	}
+	for _, key := range e.openCycleKeysForAuthLocked(authIndex) {
+		nextRefreshAt := e.state.OpenCycles[key].NextRefreshAt
+		if !nextRefreshAt.IsZero() && !recordedAt.Before(nextRefreshAt) {
+			return true
+		}
+	}
+	return false
 }
 
 // RecordExhaustionEvent stores a passive usage_limit_reached event for the selected Codex auth.

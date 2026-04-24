@@ -148,3 +148,46 @@ func TestAPICallIgnoresNonWhamUsageRequests(t *testing.T) {
 		t.Fatal("expected no recorded observation for non-wham endpoint")
 	}
 }
+
+func TestGetCodexQuotaEstimatorByAuthOmitsZeroTimes(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	auth := &coreauth.Auth{
+		ID:       "codex-oauth-auth",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email": "codex@example.com",
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	estimator := quotaestimator.New("")
+	handler := NewHandlerWithoutConfigFilePath(&config.Config{}, manager)
+	handler.SetQuotaEstimator(estimator)
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/quota-estimator/codex/"+auth.EnsureIndex(), nil)
+	ginCtx.Params = gin.Params{{Key: "authIndex", Value: auth.EnsureIndex()}}
+
+	handler.GetCodexQuotaEstimatorByAuth(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	if strings.Contains(body, "0001-01-01") {
+		t.Fatalf("expected zero time to be omitted, body=%s", body)
+	}
+	if strings.Contains(body, "last_quota_refresh_at") {
+		t.Fatalf("expected empty last_quota_refresh_at to be omitted, body=%s", body)
+	}
+	if strings.Contains(body, "last_observation_at") {
+		t.Fatalf("expected empty last_observation_at to be omitted, body=%s", body)
+	}
+}
