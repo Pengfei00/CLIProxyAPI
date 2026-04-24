@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/quotaestimator"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -35,19 +36,21 @@ const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
-	cfg                 *config.Config
-	configFilePath      string
-	mu                  sync.Mutex
-	attemptsMu          sync.Mutex
-	failedAttempts      map[string]*attemptInfo // keyed by client IP
-	authManager         *coreauth.Manager
-	usageStats          *usage.RequestStatistics
-	tokenStore          coreauth.Store
-	localPassword       string
-	allowRemoteOverride bool
-	envSecret           string
-	logDir              string
-	postAuthHook        coreauth.PostAuthHook
+	cfg                  *config.Config
+	configFilePath       string
+	mu                   sync.Mutex
+	attemptsMu           sync.Mutex
+	failedAttempts       map[string]*attemptInfo // keyed by client IP
+	authManager          *coreauth.Manager
+	usageStats           *usage.RequestStatistics
+	tokenStore           coreauth.Store
+	localPassword        string
+	allowRemoteOverride  bool
+	envSecret            string
+	logDir               string
+	postAuthHook         coreauth.PostAuthHook
+	quotaEstimator       *quotaestimator.Estimator
+	apiCallTransportHook func(auth *coreauth.Auth) http.RoundTripper
 }
 
 // NewHandler creates a new management handler instance.
@@ -146,6 +149,14 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetQuotaEstimator updates the quota estimator reference used by management endpoints.
+func (h *Handler) SetQuotaEstimator(estimator *quotaestimator.Estimator) {
+	if h == nil {
+		return
+	}
+	h.quotaEstimator = estimator
 }
 
 // Middleware enforces access control for management endpoints.

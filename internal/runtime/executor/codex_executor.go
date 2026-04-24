@@ -14,6 +14,7 @@ import (
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/quotaestimator"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -222,6 +223,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
+		recordCodexQuotaExhaustion(ctx, auth, baseModel, httpResp.StatusCode, b, time.Now().UTC())
 		return resp, err
 	}
 	data, err := io.ReadAll(httpResp.Body)
@@ -369,6 +371,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = newCodexStatusErr(httpResp.StatusCode, b)
+		recordCodexQuotaExhaustion(ctx, auth, baseModel, httpResp.StatusCode, b, time.Now().UTC())
 		return resp, err
 	}
 	data, err := io.ReadAll(httpResp.Body)
@@ -467,6 +470,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		helps.AppendAPIResponseChunk(ctx, e.cfg, data)
 		helps.LogWithRequestID(ctx).Debugf("request error, error status: %d, error message: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), data))
 		err = newCodexStatusErr(httpResp.StatusCode, data)
+		recordCodexQuotaExhaustion(ctx, auth, baseModel, httpResp.StatusCode, data, time.Now().UTC())
 		return nil, err
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -869,10 +873,7 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 }
 
 func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time.Duration {
-	if statusCode != http.StatusTooManyRequests || len(errorBody) == 0 {
-		return nil
-	}
-	if strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()) != "usage_limit_reached" {
+	if !isCodexUsageLimitReached(statusCode, errorBody) {
 		return nil
 	}
 	if resetsAt := gjson.GetBytes(errorBody, "error.resets_at").Int(); resetsAt > 0 {
@@ -887,6 +888,28 @@ func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time
 		return &retryAfter
 	}
 	return nil
+}
+
+func isCodexUsageLimitReached(statusCode int, errorBody []byte) bool {
+	if statusCode != http.StatusTooManyRequests || len(errorBody) == 0 {
+		return false
+	}
+	return strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()) == "usage_limit_reached"
+}
+
+func recordCodexQuotaExhaustion(ctx context.Context, auth *cliproxyauth.Auth, model string, statusCode int, errorBody []byte, observedAt time.Time) {
+	if auth == nil || !quotaestimator.IsCodexOAuthAuth(auth) {
+		return
+	}
+	estimator := quotaestimator.FromContext(ctx)
+	if estimator == nil {
+		return
+	}
+	if !isCodexUsageLimitReached(statusCode, errorBody) {
+		return
+	}
+	retryAfter := parseCodexRetryAfter(statusCode, errorBody, observedAt)
+	estimator.RecordExhaustionEvent(auth, model, retryAfter, observedAt)
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {

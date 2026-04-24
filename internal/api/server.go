@@ -28,6 +28,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/quotaestimator"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -177,6 +178,8 @@ type Server struct {
 	keepAliveOnTimeout func()
 	keepAliveHeartbeat chan struct{}
 	keepAliveStop      chan struct{}
+
+	quotaEstimator *quotaestimator.Estimator
 }
 
 // NewServer creates and initializes a new API server instance.
@@ -239,6 +242,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	envAdminPassword, envAdminPasswordSet := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envAdminPassword = strings.TrimSpace(envAdminPassword)
 	envManagementSecret := envAdminPasswordSet && envAdminPassword != ""
+	quotaEstimator := quotaestimator.New(quotaestimator.ResolveStatePath(configFilePath, cfg))
 
 	// Create server instance
 	s := &Server{
@@ -252,6 +256,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		currentPath:         wd,
 		envManagementSecret: envManagementSecret,
 		wsRoutes:            make(map[string]struct{}),
+		quotaEstimator:      quotaEstimator,
 	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	// Save initial YAML snapshot
@@ -265,6 +270,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	applySignatureCacheConfig(nil, cfg)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
+	s.mgmt.SetQuotaEstimator(quotaEstimator)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
@@ -274,6 +280,12 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
 	s.localPassword = optionState.localPassword
+	engine.Use(func(c *gin.Context) {
+		if quotaEstimator != nil {
+			quotaestimator.AttachToGin(c, quotaEstimator)
+		}
+		c.Next()
+	})
 
 	// Setup routes
 	s.setupRoutes()
@@ -530,6 +542,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
+		mgmt.GET("/quota-estimator/codex", s.mgmt.GetCodexQuotaEstimator)
+		mgmt.GET("/quota-estimator/codex/:authIndex", s.mgmt.GetCodexQuotaEstimatorByAuth)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)
@@ -840,6 +854,11 @@ func (s *Server) Stop(ctx context.Context) error {
 	// Shutdown the HTTP server.
 	if err := s.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", err)
+	}
+	if s.quotaEstimator != nil {
+		if err := s.quotaEstimator.Close(); err != nil {
+			return fmt.Errorf("failed to flush quota estimator state: %w", err)
+		}
 	}
 
 	log.Debug("API server stopped")

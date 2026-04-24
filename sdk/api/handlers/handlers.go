@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/quotaestimator"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -340,6 +341,11 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx, cancel := context.WithCancel(parentCtx)
 	cancelCtx := newCtx
+	if requestCtx != nil {
+		if estimator := quotaestimator.FromContext(requestCtx); estimator != nil {
+			newCtx = quotaestimator.WithContext(newCtx, estimator)
+		}
+	}
 	if requestCtx != nil && requestCtx != parentCtx {
 		go func() {
 			select {
@@ -351,6 +357,17 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
+	if h != nil && h.AuthManager != nil && c != nil {
+		existingSelectedCallback := selectedAuthIDCallbackFromContext(newCtx)
+		newCtx = WithSelectedAuthIDCallback(newCtx, func(authID string) {
+			if existingSelectedCallback != nil {
+				existingSelectedCallback(authID)
+			}
+			if auth, ok := h.AuthManager.GetByID(authID); ok {
+				quotaestimator.SetSelectedAuth(c, auth)
+			}
+		})
+	}
 	return newCtx, func(params ...interface{}) {
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {

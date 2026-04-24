@@ -12,6 +12,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/quotaestimator"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/geminicli"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
@@ -208,6 +209,7 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	h.recordQuotaObservation(auth, parsedURL, respBody, time.Now().UTC())
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
@@ -613,6 +615,32 @@ func tokenValueFromMetadata(metadata map[string]any) string {
 	return ""
 }
 
+func (h *Handler) recordQuotaObservation(auth *coreauth.Auth, parsedURL *url.URL, respBody []byte, observedAt time.Time) {
+	if h == nil || h.quotaEstimator == nil {
+		return
+	}
+	if !quotaestimator.IsCodexOAuthAuth(auth) {
+		return
+	}
+	if !isWhamUsageRequest(parsedURL) {
+		return
+	}
+	if err := h.quotaEstimator.RecordObservationFromBody(auth, respBody, observedAt); err != nil {
+		log.WithError(err).Debug("management APICall: failed to record wham/usage observation")
+	}
+}
+
+func isWhamUsageRequest(parsedURL *url.URL) bool {
+	if parsedURL == nil {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSpace(parsedURL.Hostname()))
+	if host != "chatgpt.com" && host != "www.chatgpt.com" {
+		return false
+	}
+	return strings.TrimSpace(parsedURL.EscapedPath()) == "/backend-api/wham/usage"
+}
+
 func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 	authIndex = strings.TrimSpace(authIndex)
 	if authIndex == "" || h == nil || h.authManager == nil {
@@ -632,6 +660,12 @@ func (h *Handler) authByIndex(authIndex string) *coreauth.Auth {
 }
 
 func (h *Handler) apiCallTransport(auth *coreauth.Auth) http.RoundTripper {
+	if h != nil && h.apiCallTransportHook != nil {
+		if transport := h.apiCallTransportHook(auth); transport != nil {
+			return transport
+		}
+	}
+
 	var proxyCandidates []string
 	if auth != nil {
 		if proxyStr := strings.TrimSpace(auth.ProxyURL); proxyStr != "" {
