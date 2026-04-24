@@ -1351,6 +1351,10 @@ func normalizePathWindowType(value string) string {
 	switch {
 	case value == "":
 		return ""
+	case strings.Contains(value, "primary_window"), strings.Contains(value, "primarywindow"), value == "primary":
+		return "5h"
+	case strings.Contains(value, "secondary_window"), strings.Contains(value, "secondarywindow"), value == "secondary":
+		return "7d"
 	case strings.Contains(value, "five_hour"), strings.Contains(value, "5h"), strings.Contains(value, "hour_5"), strings.Contains(value, "5_hour"):
 		return "5h"
 	case strings.Contains(value, "seven_day"), strings.Contains(value, "7d"), strings.Contains(value, "day_7"), strings.Contains(value, "7_day"):

@@ -80,6 +80,68 @@ func TestRecordUsageAggregatesPerModel(t *testing.T) {
 	}
 }
 
+func TestParseObservationSupportsWhamPrimaryAndSecondaryWindows(t *testing.T) {
+	t.Parallel()
+
+	auth := testCodexOAuthAuth()
+	authIndex := auth.EnsureIndex()
+	observedAt := time.Date(2026, 4, 24, 7, 0, 0, 0, time.UTC)
+
+	observation, err := ParseObservation([]byte(`{
+		"plan_type":"plus",
+		"rate_limit":{
+			"allowed":true,
+			"limit_reached":false,
+			"primary_window":{
+				"used_percent":99,
+				"limit_window_seconds":18000,
+				"reset_after_seconds":3327,
+				"reset_at":1777017076
+			},
+			"secondary_window":{
+				"used_percent":67,
+				"limit_window_seconds":604800,
+				"reset_after_seconds":435902,
+				"reset_at":1777449650
+			}
+		}
+	}`), auth, observedAt)
+	if err != nil {
+		t.Fatalf("ParseObservation returned error: %v", err)
+	}
+	if observation.AuthIndex != authIndex {
+		t.Fatalf("auth_index = %q, want %q", observation.AuthIndex, authIndex)
+	}
+	if observation.PlanType != "plus" {
+		t.Fatalf("plan_type = %q, want plus", observation.PlanType)
+	}
+	if len(observation.Windows) != 2 {
+		t.Fatalf("windows len = %d, want 2", len(observation.Windows))
+	}
+
+	primary := observation.Windows[0]
+	if primary.WindowType != "5h" {
+		t.Fatalf("primary window_type = %q, want 5h", primary.WindowType)
+	}
+	if primary.UsedPercent != 99 {
+		t.Fatalf("primary used_percent = %v, want 99", primary.UsedPercent)
+	}
+	if primary.ResetAt.Unix() != 1777017076 {
+		t.Fatalf("primary reset_at = %v, want unix 1777017076", primary.ResetAt)
+	}
+
+	secondary := observation.Windows[1]
+	if secondary.WindowType != "7d" {
+		t.Fatalf("secondary window_type = %q, want 7d", secondary.WindowType)
+	}
+	if secondary.UsedPercent != 67 {
+		t.Fatalf("secondary used_percent = %v, want 67", secondary.UsedPercent)
+	}
+	if secondary.ResetAt.Unix() != 1777449650 {
+		t.Fatalf("secondary reset_at = %v, want unix 1777449650", secondary.ResetAt)
+	}
+}
+
 func TestFirstObservationSetsLastRefreshTime(t *testing.T) {
 	t.Parallel()
 
