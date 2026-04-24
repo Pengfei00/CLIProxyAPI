@@ -442,6 +442,7 @@ func resolveSuccess(ctx context.Context) bool {
 const httpStatusBadRequest = 400
 
 func normaliseDetail(detail coreusage.Detail) TokenStats {
+	detail = coreusage.NormalizeDetail(detail)
 	tokens := TokenStats{
 		InputTokens:     detail.InputTokens,
 		OutputTokens:    detail.OutputTokens,
@@ -449,22 +450,11 @@ func normaliseDetail(detail coreusage.Detail) TokenStats {
 		CachedTokens:    detail.CachedTokens,
 		TotalTokens:     detail.TotalTokens,
 	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens + detail.CachedTokens
-	}
 	return tokens
 }
 
 func normaliseTokenStats(tokens TokenStats) TokenStats {
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
-	}
-	if tokens.TotalTokens == 0 {
-		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
-	}
+	tokens.TotalTokens = coreusage.ResolveTotalTokens(tokens.InputTokens, tokens.OutputTokens, tokens.TotalTokens)
 	return tokens
 }
 

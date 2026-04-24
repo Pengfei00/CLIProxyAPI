@@ -80,6 +80,24 @@ func TestRecordUsageAggregatesPerModel(t *testing.T) {
 	}
 }
 
+func TestTokenSummaryFromDetailDoesNotDoubleCountReasoningTokens(t *testing.T) {
+	t.Parallel()
+
+	summary := tokenSummaryFromDetail(coreusage.Detail{
+		InputTokens:     10,
+		CachedTokens:    3,
+		OutputTokens:    20,
+		ReasoningTokens: 9,
+	})
+
+	if summary.ReadTokens != 7 {
+		t.Fatalf("read_tokens = %d, want 7", summary.ReadTokens)
+	}
+	if summary.TotalTokens != 30 {
+		t.Fatalf("total_tokens = %d, want 30", summary.TotalTokens)
+	}
+}
+
 func TestParseObservationSupportsWhamPrimaryAndSecondaryWindows(t *testing.T) {
 	t.Parallel()
 

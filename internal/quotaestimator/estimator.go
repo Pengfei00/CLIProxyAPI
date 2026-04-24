@@ -1211,23 +1211,17 @@ func addModelUsage(models map[string]TokenSummary, model string, summary TokenSu
 }
 
 func tokenSummaryFromDetail(detail coreusage.Detail) TokenSummary {
+	detail = coreusage.NormalizeDetail(detail)
 	readTokens := detail.InputTokens - detail.CachedTokens
 	if readTokens < 0 {
 		readTokens = 0
-	}
-	totalTokens := detail.TotalTokens
-	if totalTokens == 0 {
-		totalTokens = detail.InputTokens + detail.OutputTokens + detail.ReasoningTokens
-	}
-	if totalTokens == 0 {
-		totalTokens = readTokens + detail.CachedTokens + detail.OutputTokens + detail.ReasoningTokens
 	}
 	return TokenSummary{
 		ReadTokens:      readTokens,
 		CacheReadTokens: detail.CachedTokens,
 		OutputTokens:    detail.OutputTokens,
 		ReasoningTokens: detail.ReasoningTokens,
-		TotalTokens:     totalTokens,
+		TotalTokens:     detail.TotalTokens,
 	}
 }
 

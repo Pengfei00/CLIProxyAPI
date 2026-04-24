@@ -32,6 +32,20 @@ func TestRequestStatisticsRecordIncludesLatency(t *testing.T) {
 	}
 }
 
+func TestNormaliseDetailDoesNotDoubleCountReasoningTokens(t *testing.T) {
+	t.Parallel()
+
+	tokens := normaliseDetail(coreusage.Detail{
+		InputTokens:     10,
+		OutputTokens:    20,
+		ReasoningTokens: 9,
+	})
+
+	if tokens.TotalTokens != 30 {
+		t.Fatalf("total_tokens = %d, want 30", tokens.TotalTokens)
+	}
+}
+
 func TestRequestStatisticsMergeSnapshotDedupIgnoresLatency(t *testing.T) {
 	stats := NewRequestStatistics()
 	timestamp := time.Date(2026, 3, 20, 12, 0, 0, 0, time.UTC)

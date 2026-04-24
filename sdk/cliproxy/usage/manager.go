@@ -31,6 +31,22 @@ type Detail struct {
 	TotalTokens     int64
 }
 
+// ResolveTotalTokens returns the provider-reported total when present.
+// When a provider omits total_tokens, fall back to input + output only.
+// ReasoningTokens is a breakdown field and must not be added again here.
+func ResolveTotalTokens(inputTokens, outputTokens, totalTokens int64) int64 {
+	if totalTokens != 0 {
+		return totalTokens
+	}
+	return inputTokens + outputTokens
+}
+
+// NormalizeDetail fills TotalTokens when the provider omitted it.
+func NormalizeDetail(detail Detail) Detail {
+	detail.TotalTokens = ResolveTotalTokens(detail.InputTokens, detail.OutputTokens, detail.TotalTokens)
+	return detail
+}
+
 // Plugin consumes usage records emitted by the proxy runtime.
 type Plugin interface {
 	HandleUsage(ctx context.Context, record Record)
