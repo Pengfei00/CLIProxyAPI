@@ -30,6 +30,7 @@ const (
 	maxClosedSamplesPerBucket      = 48
 	observationNoisePercent        = 0.5
 	exhaustedThresholdPercent      = 99.0
+	resetAtDriftTolerance          = time.Minute
 	defaultPersistDebounce         = 750 * time.Millisecond
 	autoRefreshMinInterval         = 30 * time.Second
 	closeReasonQuotaRefreshed      = "quota_refreshed"
@@ -1070,16 +1071,57 @@ func roundPercent(v float64) float64 {
 	return math.Round(v*100) / 100
 }
 
-func shouldRefreshCycle(cycle OpenQuotaCycle, prevWindow QuotaWindowObservation, hasPrevWindow bool, currentWindow QuotaWindowObservation) bool {
+func shouldRefreshCycle(
+	cycle OpenQuotaCycle,
+	prevWindow QuotaWindowObservation,
+	hasPrevWindow bool,
+	currentWindow QuotaWindowObservation,
+) bool {
 	currentUsed := currentWindow.UsedPercent
 	prevUsed := cycle.CurrentUsedPercent
 	if hasPrevWindow {
 		prevUsed = prevWindow.UsedPercent
-		if prevWindow.ResetIdentifier != "" && currentWindow.ResetIdentifier != "" && prevWindow.ResetIdentifier != currentWindow.ResetIdentifier {
-			return true
-		}
 	}
-	return currentUsed+observationNoisePercent < prevUsed
+	if currentUsed+observationNoisePercent < prevUsed {
+		return true
+	}
+	if !hasPrevWindow || !resetBoundaryChangedSignificantly(prevWindow, currentWindow) {
+		return false
+	}
+	if cycle.ExhaustedPending || cycle.ExhaustedConfirmed || prevUsed >= exhaustedThresholdPercent || !prevWindow.Available {
+		return currentWindow.Available && currentUsed < exhaustedThresholdPercent
+	}
+	return false
+}
+
+func resetBoundaryChangedSignificantly(prevWindow, currentWindow QuotaWindowObservation) bool {
+	prevBoundary, prevOK := resetBoundaryTime(prevWindow)
+	currentBoundary, currentOK := resetBoundaryTime(currentWindow)
+	if prevOK && currentOK {
+		return boundaryDriftDuration(prevBoundary, currentBoundary) > resetAtDriftTolerance
+	}
+	if prevWindow.ResetIdentifier != "" && currentWindow.ResetIdentifier != "" {
+		return prevWindow.ResetIdentifier != currentWindow.ResetIdentifier
+	}
+	return false
+}
+
+func resetBoundaryTime(window QuotaWindowObservation) (time.Time, bool) {
+	if !window.ResetAt.IsZero() {
+		return window.ResetAt.UTC(), true
+	}
+	if ts, ok := timeValue(window.ResetIdentifier); ok {
+		return ts.UTC(), true
+	}
+	return time.Time{}, false
+}
+
+func boundaryDriftDuration(left, right time.Time) time.Duration {
+	delta := left.Sub(right)
+	if delta < 0 {
+		return -delta
+	}
+	return delta
 }
 
 func closeReasonFromTransition(cycle OpenQuotaCycle, prevWindow QuotaWindowObservation, hasPrevWindow bool) string {

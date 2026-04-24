@@ -263,6 +263,138 @@ func TestRecordObservationDetectsRefreshAndClosesSample(t *testing.T) {
 	}
 }
 
+func TestRecordObservationKeepsCurrentCycleForResetDriftWithinOneMinute(t *testing.T) {
+	t.Parallel()
+
+	estimator := New("")
+	auth := testCodexOAuthAuth()
+	authIndex := auth.EnsureIndex()
+	start := time.Date(2026, 4, 24, 7, 22, 31, 0, time.UTC)
+	firstResetAt := time.Date(2026, 4, 24, 7, 51, 16, 0, time.UTC)
+	secondObservedAt := start.Add(29 * time.Second)
+	secondResetAt := firstResetAt.Add(-45 * time.Second)
+
+	estimator.RecordObservation(QuotaObservation{
+		ObservedAt: start,
+		AuthID:     auth.ID,
+		AuthIndex:  authIndex,
+		PlanType:   "plus",
+		Windows: []QuotaWindowObservation{{
+			WindowType:      "5h",
+			UsedPercent:     99,
+			Available:       true,
+			ResetAt:         firstResetAt,
+			ResetIdentifier: firstResetAt.Format(time.RFC3339),
+		}},
+	})
+	estimator.RecordUsage(coreusage.Record{
+		AuthID:      auth.ID,
+		AuthIndex:   authIndex,
+		Model:       "gpt-5.4",
+		RequestedAt: start.Add(10 * time.Second),
+		Detail: coreusage.Detail{
+			InputTokens:     100,
+			CachedTokens:    20,
+			OutputTokens:    30,
+			ReasoningTokens: 5,
+			TotalTokens:     155,
+		},
+	}, auth)
+	estimator.RecordObservation(QuotaObservation{
+		ObservedAt: secondObservedAt,
+		AuthID:     auth.ID,
+		AuthIndex:  authIndex,
+		PlanType:   "plus",
+		Windows: []QuotaWindowObservation{{
+			WindowType:      "5h",
+			UsedPercent:     99,
+			Available:       true,
+			ResetAt:         secondResetAt,
+			ResetIdentifier: secondResetAt.Format(time.RFC3339),
+		}},
+	})
+
+	detail := estimator.Detail(authIndex, auth)
+	if len(detail.ClosedSamples["5h"]) != 0 {
+		t.Fatalf("closed samples len = %d, want 0", len(detail.ClosedSamples["5h"]))
+	}
+	current := detail.CurrentEstimates["5h"]
+	if !current.CurrentCycleStartedAt.Equal(start) {
+		t.Fatalf("current_cycle_started_at = %v, want %v", current.CurrentCycleStartedAt, start)
+	}
+	if !current.LastRefreshAt.Equal(secondObservedAt) {
+		t.Fatalf("last_refresh_at = %v, want %v", current.LastRefreshAt, secondObservedAt)
+	}
+	if current.CurrentTokens.TotalTokens != 155 {
+		t.Fatalf("current total_tokens = %d, want 155", current.CurrentTokens.TotalTokens)
+	}
+	if got := current.PerModel["gpt-5.4"].TotalTokens; got != 155 {
+		t.Fatalf("gpt-5.4 total_tokens = %d, want 155", got)
+	}
+}
+
+func TestRecordObservationDoesNotSplitCycleOnResetShiftBeforeBoundary(t *testing.T) {
+	t.Parallel()
+
+	estimator := New("")
+	auth := testCodexOAuthAuth()
+	authIndex := auth.EnsureIndex()
+	start := time.Date(2026, 4, 24, 0, 0, 0, 0, time.UTC)
+	firstResetAt := start.Add(5 * time.Hour)
+	secondObservedAt := start.Add(30 * time.Minute)
+	secondResetAt := firstResetAt.Add(2 * time.Minute)
+
+	estimator.RecordObservation(QuotaObservation{
+		ObservedAt: start,
+		AuthID:     auth.ID,
+		AuthIndex:  authIndex,
+		PlanType:   "pro",
+		Windows: []QuotaWindowObservation{{
+			WindowType:      "5h",
+			UsedPercent:     20,
+			Available:       true,
+			ResetAt:         firstResetAt,
+			ResetIdentifier: firstResetAt.Format(time.RFC3339),
+		}},
+	})
+	estimator.RecordUsage(coreusage.Record{
+		AuthID:      auth.ID,
+		AuthIndex:   authIndex,
+		Model:       "gpt-5.4",
+		RequestedAt: start.Add(5 * time.Minute),
+		Detail: coreusage.Detail{
+			InputTokens:  50,
+			OutputTokens: 10,
+			TotalTokens:  60,
+		},
+	}, auth)
+	estimator.RecordObservation(QuotaObservation{
+		ObservedAt: secondObservedAt,
+		AuthID:     auth.ID,
+		AuthIndex:  authIndex,
+		PlanType:   "pro",
+		Windows: []QuotaWindowObservation{{
+			WindowType:      "5h",
+			UsedPercent:     20,
+			Available:       true,
+			ResetAt:         secondResetAt,
+			ResetIdentifier: secondResetAt.Format(time.RFC3339),
+		}},
+	})
+
+	detail := estimator.Detail(authIndex, auth)
+	if len(detail.ClosedSamples["5h"]) != 0 {
+		t.Fatalf("closed samples len = %d, want 0", len(detail.ClosedSamples["5h"]))
+	}
+	current := detail.CurrentEstimates["5h"]
+	if !current.CurrentCycleStartedAt.Equal(start) {
+		t.Fatalf("current_cycle_started_at = %v, want %v", current.CurrentCycleStartedAt, start)
+	}
+	if current.CurrentTokens.TotalTokens != 60 {
+		t.Fatalf("current total_tokens = %d, want 60", current.CurrentTokens.TotalTokens)
+	}
+}
+
 func TestRecordUsageWithContextAutoRefreshKeepsCurrentCycle(t *testing.T) {
 	t.Parallel()
 
